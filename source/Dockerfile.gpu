@@ -1,31 +1,89 @@
+# Usar la imagen base de NVIDIA HPC SDK
 FROM nvcr.io/nvidia/nvhpc:20.11-devel-cuda_multi-ubuntu20.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt update && apt install -y dos2unix
-RUN apt update && apt install -y libnetcdf-dev build-essential autoconf automake libtool pkg-config tzdata
-# copy the compilers
-RUN cd /opt/nvidia/hpc_sdk/Linux_x86_64/20.11/REDIST/compilers && tar -czvhf /root/nvidia-20.11.tar.gz * && cd -
+
+# Instalar dependencias necesarias, incluyendo HDF5
+RUN apt update && apt install -y dos2unix libhdf5-dev libcurl4-openssl-dev zlib1g-dev build-essential \
+    autoconf automake libtool pkg-config tzdata wget
+
+# Establecer las rutas correctas de HDF5
+ENV CPPFLAGS="-I/usr/include/hdf5/serial"
+ENV LDFLAGS="-L/usr/lib/x86_64-linux-gnu/hdf5/serial"
+ENV LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu/hdf5/serial:$LD_LIBRARY_PATH"
+
+# Instalar NetCDF-C (4.7.4) manualmente, especificando las rutas de HDF5
+RUN wget https://github.com/Unidata/netcdf-c/archive/v4.7.4.tar.gz && \
+    tar -xzf v4.7.4.tar.gz && \
+    cd netcdf-c-4.7.4 && \
+    ./configure --enable-netcdf-4 --with-hdf5=/usr --with-zlib --enable-dap && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && rm -rf netcdf-c-4.7.4 v4.7.4.tar.gz
+
+# Establecer las rutas correctas de NetCDF-C para la instalación de NetCDF-Fortran
+ENV CPPFLAGS="-I/usr/local/include"
+ENV LDFLAGS="-L/usr/local/lib"
+ENV LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
+
+# Instalar NetCDF-Fortran (4.6.1) manualmente
+RUN wget https://github.com/Unidata/netcdf-fortran/archive/v4.6.1.tar.gz && \
+    tar -xzf v4.6.1.tar.gz && \
+    cd netcdf-fortran-4.6.1 && \
+    # Eliminar archivos de módulo antiguos si existen
+    find /usr/local/include -name 'netcdf4_f03.mod' -delete && \
+    # Limpiar cualquier posible directorio de construcción previo
+    find . -name '*.mod' -delete && \
+    ./configure --with-netcdf=/usr/local && \
+    make && \
+    make install && \
+    cd .. && rm -rf netcdf-fortran-4.6.1 v4.6.1.tar.gz
+
+# Eliminar archivos de módulos viejos
+RUN rm -f /usr/local/include/netcdf*.mod
+
+# Copiar los compiladores de NVIDIA
+RUN cd /opt/nvidia/hpc_sdk/Linux_x86_64/20.11/REDIST/compilers && \
+    tar -czvhf /root/nvidia-20.11.tar.gz * && \
+    cd - && rm -rf /opt/nvidia/hpc_sdk/Linux_x86_64/20.11/REDIST
+
+# Copiar el código fuente del proyecto
 COPY . /usr/src/sfincs
 WORKDIR /usr/src/sfincs
 
-RUN find . -name \*.m4|xargs dos2unix && find . -name \*.ac|xargs dos2unix && find . -name \*.am|xargs dos2unix
-RUN find . -name \*.f90|xargs dos2unix
-RUN find . -name \*.F90|xargs dos2unix
-RUN find . -name \*.am|xargs dos2unix
-# ccall ->  Generate code for all compute capabilities supported by this platform and by the selected or default CUDA Toolkit.
-RUN autoreconf -vif && FCFLAGS="-acc -Minfo=accel -fast -O3 -gpu=ccall -DSIZEOF_PTRDIFF_T=8" FC=nvfortran ./configure --disable-shared --disable-openmp  && make && make install
+# Convertir archivos a formato UNIX (por si son de Windows)
+RUN find . -name \*.m4 -o -name \*.ac -o -name \*.am -o -name \*.f90 -o -name \*.F90 | xargs dos2unix
 
+# Ejecutar autoreconf, configurar, compilar e instalar
+RUN cd /usr/src/sfincs && \
+    autoreconf -vif && \
+    ls -la && \
+    FCFLAGS="-acc -Minfo=accel -fast -O3 -gpu=ccall -DSIZEOF_PTRDIFF_T=8" FC=nvfortran \
+    ./configure --disable-shared --disable-openmp && \
+    make -d && \
+    make && \
+    make install
+
+# Segunda fase del contenedor, usando CUDA runtime
 FROM nvidia/cuda:11.2.2-runtime-ubuntu20.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt update && apt install -y libnetcdf-dev tzdata
-# copy nvidia SDK (REDIST folder contains symlinks)
+
+# Instalar dependencias necesarias para la ejecución, incluyendo libcurl
+RUN apt update && apt install -y libnetcdf-dev libcurl4 tzdata
+
+# Copiar el SDK de NVIDIA y el software compilado
 COPY --from=0 /root/nvidia-20.11.tar.gz .
-# copy software
 COPY --from=0 /usr/local /usr/local
-RUN mkdir -p /opt/nvidia/compilers
-RUN tar -xzf nvidia-20.11.tar.gz -C /opt/nvidia/compilers
-# add the REDIST libs to the environment
-ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/opt/nvidia/compilers/lib
+RUN mkdir -p /opt/nvidia/compilers && \
+    tar -xzf nvidia-20.11.tar.gz -C /opt/nvidia/compilers && \
+    rm nvidia-20.11.tar.gz
+
+# Agregar las bibliotecas REDIST al entorno
+ENV LD_LIBRARY_PATH="/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/opt/nvidia/compilers/lib:$LD_LIBRARY_PATH"
+RUN ldconfig
+
+# Definir el volumen de trabajo
 VOLUME /data
 WORKDIR /data
-CMD ["sfincs"]
 
+# Ejecutar sfincs como el comando predeterminado
+CMD ["sfincs"]
